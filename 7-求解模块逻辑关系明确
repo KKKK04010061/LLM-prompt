@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import json
+import time
+import itertools
+from typing import Dict, List, Any, Optional, Tuple
+
+import pandas as pd
+import requests
+
+# =========================
+# 0) Paths (EDIT IF NEEDED)
+# =========================
+MODULE_XLSX   = r"D:/刘kk/第七章-131样本/14-问题求解模块抽取结果.xlsx"
+PARADIGM_XLSX = r"D:/刘kk/第七章-131样本/结构化范式归纳结果.xlsx"
+OUT_XLSX      = r"D:/刘kk/第七章-131样本/14-基于大模型的模块逻辑关系分析结果.xlsx"
+CACHE_JSONL   = r"D:/刘kk/第七章-131样本/14-_cache_module_relations.jsonl"
+
+os.makedirs(os.path.dirname(OUT_XLSX), exist_ok=True)
+
+# =========================
+# 1) API Config (EDIT IF NEEDED)
+# =========================
+BASE_URL   = "https://apihw.sharkchat.cn"
+API_KEY    = os.getenv("SHARKCHAT_API_KEY", "sk-yHfknDpSTH8vAMKPf59MQJ2QNRDZnUK0F7ijfYLrIbiF5scT")  # 强烈建议用环境变量，不要硬编码
+CHAT_MODEL = "gpt-3.5-turbo"
+
+if not API_KEY:
+    raise RuntimeError("未检测到环境变量 SHARKCHAT_API_KEY。请先设置后再运行。")
+
+# =========================
+# 2) Prompt Strategy (EN) - FULL CONTENT
+# =========================
+PROMPT_STRATEGY_EN = r"""
+[Role]
+You are an “interdisciplinary scientific problem-solving pathway analysis expert” with cross-disciplinary methodology knowledge and process modeling ability.
+Your task is: under disciplinary paradigm constraints, determine the logical relationship type and direction between problem-solving modules, and provide traceable justification.
+
+[Instruction]
+(1) ONLY use the given module content and the cross-disciplinary knowledge evidence in the input. Do NOT introduce new modules, new relation types, or external/common-sense expansions.
+(2) For the module set of the SAME problem, analyze the relationship for EACH module pair (Module A vs Module B).
+(3) The relation type MUST be chosen from the given set ONLY: Parallel / Causal / Progressive.
+    You MUST also provide the direction (A→B or B→A), and explain the direction basis.
+(4) Each relation MUST provide a short “Decision Rationale” containing ALL three elements:
+    ① Semantic basis: what subtask the module solves and what output it produces;
+    ② Evidence basis: quote key “problem elements / cross-disciplinary knowledge” under the module as evidence;
+    ③ Paradigm basis: quote relevant “paradigm rules / typical pipeline” of the involved disciplines as constraint.
+(5) Output should cover KEY relations: prioritize “strong dependencies (Causal/Progressive)” and “parallel support (Parallel)”.
+    Avoid producing many weakly-related or repetitive relations.
+
+[Input]
+Two tables are provided:
+- Problem-solving module extraction results (modules + elements + evidence)
+- Structured disciplinary paradigm induction results (discipline paradigms)
+
+[Disciplinary Paradigm Constraints]
+Paradigm induction results are provided as a table. You MUST use only the paradigms of disciplines involved in the current problem.
+
+[Relation Types]
+There are 3 relation types:
+(1) Parallel: Two modules can proceed concurrently without strict prerequisite; equally important for solving the same problem element; mutually supporting/complementary.
+(2) Causal: Module A’s output directly affects or determines Module B’s input/feasibility; without A, B cannot proceed reasonably or its effectiveness is severely limited.
+(3) Progressive: Module B further deepens/enhances based on Module A.
+
+Requirement: Each relation MUST provide a direction (A→B or B→A) and explain the direction basis.
+
+[Output]
+Return a structured relation set with AT LEAST the following fields:
+- module_a, module_b
+- relation_type (Parallel/Causal/Progressive)
+- direction (A->B or B->A)
+- decision_rationale (must include semantics + evidence + paradigm)
+- confidence (High/Medium/Low)
+
+Consistency constraints:
+- For the same module pair, output ONLY ONE relation.
+- If evidence is insufficient, output "Uncertain" (or skip the pair).
+"""
+
+# =========================
+# 3) Helpers: robust column detection
+# =========================
+def pick_col(df: pd.DataFrame, candidates: List[str], required: bool = True) -> Optional[str]:
+    cols_lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand in df.columns:
+            return cand
+        if cand.lower() in cols_lower:
+            return cols_lower[cand.lower()]
+    if required:
+        raise KeyError(f"找不到列：候选={candidates}，实际列={list(df.columns)}")
+    return None
+
+
+def norm_text(x: Any) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    s = str(x).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def safe_unique(seq: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for s in seq:
+        s2 = s.strip()
+        if not s2:
+            continue
+        if s2 not in seen:
+            seen.add(s2)
+            out.append(s2)
+    return out
+
+
+def assert_required_columns(df: pd.DataFrame, required_cols: List[str], df_name: str) -> None:
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"[{df_name}] 缺少必需列：{missing}\n实际列={list(df.columns)}")
+
+
+# =========================
+# 4) Load & normalize paradigms
+# =========================
+def paradigms_to_dict(paradigms_df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    """
+    Support both formats:
+    A) Wide: discipline + multiple fields columns
+    B) Long: discipline + Item + Content
+    """
+    discipline_col = pick_col(paradigms_df, ["Discipline", "discipline", "学科", "discipline_name"])
+    item_col = pick_col(paradigms_df, ["Item", "item", "字段", "Field"], required=False)
+    content_col = pick_col(paradigms_df, ["Content", "content", "内容", "Value"], required=False)
+
+    result: Dict[str, Dict[str, str]] = {}
+
+    if item_col and content_col:
+        # Long format
+        for disc, sub in paradigms_df.groupby(discipline_col):
+            disc_name = norm_text(disc)
+            d: Dict[str, str] = {}
+            for _, r in sub.iterrows():
+                k = norm_text(r[item_col])
+                v = norm_text(r[content_col])
+                if k and v:
+                    d[k] = v
+            result[disc_name] = d
+        return result
+
+    # Wide format
+    wide_cols = [c for c in paradigms_df.columns if c != discipline_col]
+    for _, r in paradigms_df.iterrows():
+        disc_name = norm_text(r[discipline_col])
+        if not disc_name:
+            continue
+        d = {}
+        for c in wide_cols:
+            v = norm_text(r[c])
+            if v:
+                d[c] = v
+        if disc_name not in result:
+            result[disc_name] = d
+        else:
+            for k, v in d.items():
+                if v and (k not in result[disc_name] or not result[disc_name][k]):
+                    result[disc_name][k] = v
+    return result
+
+
+def format_paradigms_text(needed_disciplines: List[str], paradigm_dict: Dict[str, Dict[str, str]]) -> str:
+    """
+    Render paradigm constraints into readable text, supporting both
+    - old field names: Research goals, Problem framing, ...
+    - your current field names: typical_research_goals, typical_problem_framing, ...
+    """
+    # (display_name, candidate_keys_in_dict)
+    canonical = [
+        ("Research goals", ["Research goals", "typical_research_goals"]),
+        ("Problem framing", ["Problem framing", "typical_problem_framing"]),
+        ("Study objects and data", ["Study objects and data", "typical_study_objects_and_data"]),
+        ("Methods and pipeline", ["Methods and pipeline", "typical_methods_and_pipeline"]),
+        ("Evaluation and statistics", ["Evaluation and statistics", "typical_evaluation_and_statistics"]),
+        ("Validation practices", ["Validation practices", "typical_validation_practices"]),
+        ("Limitations and futurework", ["Limitations and futurework", "typical_limitations_and_futurework"]),
+        ("Paradigm rules for module reasoning", ["Paradigm rules for module reasoning", "paradigm_rules_for_module_reasoning"]),
+        ("Summary scope", ["summary_scope"]),
+        ("Supporting paper ids", ["supporting_paper_ids"]),
+    ]
+
+    blocks = []
+    for disc in needed_disciplines:
+        d = paradigm_dict.get(disc, {})
+        if not d:
+            continue
+
+        lines = [f"Discipline: {disc}"]
+        used = set()
+
+        for display, keys in canonical:
+            for k in keys:
+                if k in d and d[k]:
+                    lines.append(f"- {display}: {d[k]}")
+                    used.add(k)
+                    break
+
+        # Append remaining fields (if any)
+        for k, v in d.items():
+            if k not in used:
+                lines.append(f"- {k}: {v}")
+
+        blocks.append("\n".join(lines))
+
+    if not blocks:
+        return "No paradigm constraints found for the involved disciplines in the provided table."
+    return "\n\n".join(blocks)
+
+
+# =========================
+# 5) Load & aggregate modules per problem
+# =========================
+def aggregate_modules(mod_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Aggregate rows into module-level objects per problem.
+    Your module file columns are:
+    - 模块标识 (module id, serial number)
+    - 对齐簇 (module semantic content/topic)
+    - 所属问题 (problem text)
+    - 所属分析维度 (dimension)
+    - 簇内学科 (discipline)
+    - 簇内问题要素 (elements)
+    - 跨学科知识 (evidence/knowledge)
+    """
+
+    # ---- REQUIRED columns (based on your confirmed schema)
+    required = ["模块标识", "对齐簇", "所属问题", "所属分析维度", "簇内学科", "簇内问题要素", "跨学科知识"]
+    assert_required_columns(mod_df, required, "模块抽取表")
+
+    problem_col = pick_col(mod_df, ["所属问题", "problem", "problem_text", "question", "研究问题句", "research_question"])
+    module_id_col = pick_col(mod_df, ["模块标识", "module_id", "module", "Module ID"])
+    topic_col = pick_col(mod_df, ["对齐簇", "cluster_label", "topic", "module_topic"])
+    dimension_col = pick_col(mod_df, ["所属分析维度", "dimension", "维度", "analysis_dimension"])
+    discipline_col = pick_col(mod_df, ["簇内学科", "discipline", "学科", "subject_en"])
+    element_col = pick_col(mod_df, ["簇内问题要素", "element_text", "问题要素", "问题要素E"], required=False)
+    knowledge_col = pick_col(mod_df, ["跨学科知识", "knowledge_text", "evidence_text", "evidence"], required=False)
+
+    colmap = {
+        "problem_col": problem_col,
+        "module_id_col": module_id_col,
+        "topic_col": topic_col,
+        "dimension_col": dimension_col,
+        "discipline_col": discipline_col,
+        "element_col": element_col or "",
+        "knowledge_col": knowledge_col or "",
+    }
+
+    # normalize textual columns
+    for c in [problem_col, module_id_col, topic_col, dimension_col, discipline_col, element_col, knowledge_col]:
+        if c and c in mod_df.columns:
+            mod_df[c] = mod_df[c].apply(norm_text)
+
+    group_cols = [problem_col, module_id_col]
+
+    rows = []
+    for (ptext, mid), sub in mod_df.groupby(group_cols):
+        disciplines = safe_unique(sub[discipline_col].tolist())
+        elements = safe_unique(sub[element_col].tolist()) if element_col else []
+        evidences = safe_unique(sub[knowledge_col].tolist()) if knowledge_col else []
+        topic = safe_unique(sub[topic_col].tolist()) if topic_col else []
+        dimension = safe_unique(sub[dimension_col].tolist()) if dimension_col else []
+
+        rows.append({
+            "problem_id": ptext,                # keep as text; can hash later if needed
+            "module_id": mid,                   # 模块标识（序号）
+            "module_topic": "; ".join(topic[:3]),       # 对齐簇（语义内容）
+            "dimension": "; ".join(dimension[:3]),      # 所属分析维度
+            "disciplines": disciplines,         # union disciplines in this module
+            "elements": elements[:10],
+            "evidences": evidences[:12],
+        })
+
+    module_table = pd.DataFrame(rows)
+    return module_table, colmap
+
+
+def format_module_text(module_row: pd.Series) -> str:
+    lines = [f"Module ID: {module_row['module_id']}"]
+    if module_row.get("module_topic"):
+        lines.append(f"Module Topic (Aligned Cluster): {module_row['module_topic']}")
+    if module_row.get("dimension"):
+        lines.append(f"Dimension: {module_row['dimension']}")
+    lines.append(f"Disciplines involved in this module: {', '.join(module_row['disciplines'])}")
+
+    if module_row["elements"]:
+        lines.append("Problem elements (within module):")
+        for e in module_row["elements"]:
+            lines.append(f"- {e}")
+
+    if module_row["evidences"]:
+        lines.append("Cross-disciplinary knowledge evidence (within module):")
+        for k in module_row["evidences"]:
+            lines.append(f"- {k}")
+
+    return "\n".join(lines)
+
+
+# =========================
+# 6) API call
+# =========================
+def chat_completion(messages: List[Dict[str, str]],
+                    temperature: float = 0.2,
+                    max_tokens: int = 900,
+                    timeout: int = 120) -> str:
+    url = f"{BASE_URL}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def parse_json_response(text: str) -> Optional[Dict[str, Any]]:
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
+
+
+# =========================
+# 7) Cache
+# =========================
+def load_cache(path: str) -> Dict[str, Dict[str, Any]]:
+    cache = {}
+    if not os.path.exists(path):
+        return cache
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                cache[obj["key"]] = obj["value"]
+            except Exception:
+                continue
+    return cache
+
+
+def append_cache(path: str, key: str, value: Dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"key": key, "value": value}, ensure_ascii=False) + "\n")
+
+
+# =========================
+# 8) Relation inference per pair
+# =========================
+def infer_relation_for_pair(problem_id: str,
+                            module_a: pd.Series,
+                            module_b: pd.Series,
+                            paradigms_text: str,
+                            cache: Dict[str, Dict[str, Any]],
+                            sleep_s: float = 0.3) -> Optional[Dict[str, Any]]:
+
+    a_id = str(module_a["module_id"])
+    b_id = str(module_b["module_id"])
+    key = f"{problem_id}||{a_id}||{b_id}"
+    if key in cache:
+        return cache[key]
+
+    module_a_text = format_module_text(module_a)
+    module_b_text = format_module_text(module_b)
+
+    system_msg = (
+        "You MUST follow the given strategy exactly. "
+        "Return ONLY a valid JSON object, with keys: "
+        "module_a, module_b, relation_type, direction, decision_rationale, confidence. "
+        "If insufficient evidence, return ONLY JSON: "
+        '{"module_a":"...","module_b":"...","relation_type":"Uncertain","direction":"NA","decision_rationale":"Insufficient evidence","confidence":"Low"}'
+    )
+
+    user_msg = f"""
+{PROMPT_STRATEGY_EN}
+
+[Current Problem]
+{problem_id}
+
+[Disciplinary Paradigm Constraints for this problem]
+{paradigms_text}
+
+[Module A]
+{module_a_text}
+
+[Module B]
+{module_b_text}
+
+[Your Task]
+Determine the relation between Module A and Module B using ONLY the given information.
+Return ONLY JSON.
+"""
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+    raw = chat_completion(messages, temperature=0.2, max_tokens=900)
+    parsed = parse_json_response(raw)
+
+    if not parsed:
+        parsed = {
+            "module_a": a_id,
+            "module_b": b_id,
+            "relation_type": "Uncertain",
+            "direction": "NA",
+            "decision_rationale": f"Model output not parseable as JSON. Raw: {raw[:200]}",
+            "confidence": "Low",
+        }
+
+    parsed.setdefault("module_a", a_id)
+    parsed.setdefault("module_b", b_id)
+    parsed.setdefault("relation_type", "Uncertain")
+    parsed.setdefault("direction", "NA")
+    parsed.setdefault("decision_rationale", "")
+    parsed.setdefault("confidence", "Low")
+
+    cache[key] = parsed
+    append_cache(CACHE_JSONL, key, parsed)
+
+    time.sleep(sleep_s)
+    return parsed
+
+
+# =========================
+# 9) Main pipeline
+# =========================
+def main():
+    modules_df = pd.read_excel(MODULE_XLSX)
+    paradigms_df = pd.read_excel(PARADIGM_XLSX)
+
+    # Paradigms
+    paradigm_dict = paradigms_to_dict(paradigms_df)
+
+    # Modules
+    module_table, colmap = aggregate_modules(modules_df)
+
+    # Cache
+    cache = load_cache(CACHE_JSONL)
+
+    outputs = []
+
+    for pid, sub in module_table.groupby("problem_id"):
+        # disciplines involved in this problem (union over modules)
+        disciplines = sorted(set(itertools.chain.from_iterable(sub["disciplines"].tolist())))
+        paradigms_text = format_paradigms_text(disciplines, paradigm_dict)
+
+        # pairwise relations among modules within this problem
+        sub = sub.reset_index(drop=True)
+        for i in range(len(sub)):
+            for j in range(i + 1, len(sub)):
+                rel = infer_relation_for_pair(
+                    problem_id=str(pid),
+                    module_a=sub.loc[i],
+                    module_b=sub.loc[j],
+                    paradigms_text=paradigms_text,
+                    cache=cache
+                )
+                outputs.append({
+                    "problem": pid,
+                    "module_a": rel.get("module_a", str(sub.loc[i, "module_id"])),
+                    "module_b": rel.get("module_b", str(sub.loc[j, "module_id"])),
+                    "module_a_topic": sub.loc[i, "module_topic"],
+                    "module_b_topic": sub.loc[j, "module_topic"],
+                    "relation_type": rel.get("relation_type", "Uncertain"),
+                    "direction": rel.get("direction", "NA"),
+                    "decision_rationale": rel.get("decision_rationale", ""),
+                    "confidence": rel.get("confidence", "Low"),
+                    "problem_disciplines": ", ".join(disciplines),
+                })
+
+    out_df = pd.DataFrame(outputs)
+
+    # Save
+    out_df.to_excel(OUT_XLSX, index=False)
+    print(f"[OK] 已输出：{OUT_XLSX}")
+    print(f"[OK] 缓存：{CACHE_JSONL}")
+    print(f"[INFO] 模块列映射：{colmap}")
+
+
+if __name__ == "__main__":
+    main()
