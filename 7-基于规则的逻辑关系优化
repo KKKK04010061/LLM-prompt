@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import math
+import pandas as pd
+from collections import defaultdict
+from typing import Dict, List, Tuple, Set, Any, Optional
+
+# =========================
+# 0) Paths (EDIT IF NEEDED)
+# =========================
+LLM_REL_XLSX   = r"D:/刘kk/第七章-2条学科交叉科学问题/2-基于大模型的模块逻辑关系分析结果.xlsx"
+REL_TYPES_XLSX = r"D:/刘kk/第七章-2条学科交叉科学问题/逻辑关系类型.xlsx"
+OUT_XLSX       = r"D:/刘kk/第七章-2条学科交叉科学问题/2-基于规则推理的模块逻辑关系优化结果.xlsx"
+
+os.makedirs(os.path.dirname(OUT_XLSX), exist_ok=True)
+
+# =========================
+# 1) Utilities
+# =========================
+def norm_text(x: Any) -> str:
+    if x is None:
+        return ""
+    try:
+        if isinstance(x, float) and math.isnan(x):
+            return ""
+    except Exception:
+        pass
+    s = str(x).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def pick_col(df: pd.DataFrame, candidates: List[str], required: bool = True) -> Optional[str]:
+    lower_map = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand in df.columns:
+            return cand
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    if required:
+        raise KeyError(f"找不到列：候选={candidates}；实际列={list(df.columns)}")
+    return None
+
+def conf_to_score(conf: str) -> int:
+    s = norm_text(conf).lower()
+    if s in ("high", "h", "3"):
+        return 3
+    if s in ("medium", "med", "m", "2"):
+        return 2
+    if s in ("low", "l", "1"):
+        return 1
+    # 尝试数值
+    try:
+        v = float(s)
+        if 0 <= v <= 1:
+            return int(round(v * 3))
+        return int(round(v))
+    except Exception:
+        return 0
+
+def normalize_arrow(direction: str) -> str:
+    s = norm_text(direction)
+    if not s:
+        return "NA"
+    s = s.replace("→", "->").replace("—>", "->")
+    s = re.sub(r"\s+", "", s).upper()
+    if s in ("NA", "N/A", "NONE"):
+        return "NA"
+    # 常见：A->B / B->A
+    if s in ("A->B", "B->A"):
+        return s
+    return "NA"
+
+def load_relation_types(rel_types_df: pd.DataFrame) -> Tuple[List[str], Dict[str, str]]:
+    rt_col = pick_col(rel_types_df, ["relation_type", "RelationType", "type", "类型"])
+    rel_types = []
+    for x in rel_types_df[rt_col].tolist():
+        t = norm_text(x)
+        if t:
+            rel_types.append(t)
+    # canonical map: case-insensitive
+    allowed_map = {t.lower(): t for t in rel_types}
+
+    # 同义词/常见变体（可按需扩展，但不引入新类型，只做映射）
+    synonyms = {
+        "parallel": "parallel",
+        "parallell": "parallel",
+        "causal": "causal",
+        "cause": "causal",
+        "causality": "causal",
+        "progressive": "progressive",
+        "progression": "progressive",
+        "sequential": "progressive",
+        "uncertain": "uncertain",
+        "unknown": "uncertain",
+    }
+    # 把 synonyms 映射到 canonical（如果表里确实存在该类型）
+    for k, v in list(synonyms.items()):
+        if v in allowed_map:
+            allowed_map[k] = allowed_map[v]
+
+    return rel_types, allowed_map
+
+def normalize_relation_type(rt: str, allowed_map: Dict[str, str]) -> str:
+    s = norm_text(rt)
+    if not s:
+        return ""
+    key = s.lower().strip()
+    key = re.sub(r"\s+", " ", key)
+    return allowed_map.get(key, s)  # 若不在允许集合里，先原样保留，后续再降级
+
+# =========================
+# 2) Graph helpers (no networkx)
+# =========================
+def build_adj(edges: List[Tuple[str, str]]) -> Dict[str, Set[str]]:
+    adj = defaultdict(set)
+    for u, v in edges:
+        adj[u].add(v)
+        if v not in adj:
+            adj[v] = adj[v]
+    return adj
+
+def find_cycle(nodes: List[str], adj: Dict[str, Set[str]]) -> Optional[List[str]]:
+    visited, in_stack = set(), set()
+    parent = {}
+
+    def dfs(u: str) -> Optional[List[str]]:
+        visited.add(u)
+        in_stack.add(u)
+        for v in adj.get(u, set()):
+            if v not in visited:
+                parent[v] = u
+                cyc = dfs(v)
+                if cyc:
+                    return cyc
+            elif v in in_stack:
+                # back edge u -> v
+                cycle = [v]
+                cur = u
+                while cur != v and cur in parent:
+                    cycle.append(cur)
+                    cur = parent[cur]
+                cycle.append(v)
+                cycle.reverse()
+                return cycle
+        in_stack.remove(u)
+        return None
+
+    for n in nodes:
+        if n not in visited:
+            cyc = dfs(n)
+            if cyc:
+                return cyc
+    return None
+
+def transitive_reduction(directed_edges: List[Tuple[str, str, int]]) -> Tuple[List[Tuple[str, str, int]], List[Tuple[str, str, int]]]:
+    """
+    对依赖边（Causal/Progressive）做传递冗余约简：
+    若存在 u->v 且存在另一条路径 u ~> v（不使用该直接边），则删掉 u->v
+    """
+    edges = [(u, v, s) for (u, v, s) in directed_edges]
+    adj = defaultdict(set)
+    for u, v, _ in edges:
+        adj[u].add(v)
+        if v not in adj:
+            adj[v] = adj[v]
+
+    to_remove = set()
+    for u, v, _ in edges:
+        if v not in adj[u]:
+            continue
+        # temporarily remove (u,v)
+        adj[u].remove(v)
+
+        # BFS/DFS reachability from u to v
+        stack = [u]
+        seen = set([u])
+        found = False
+        while stack and not found:
+            x = stack.pop()
+            for y in adj.get(x, set()):
+                if y == v:
+                    found = True
+                    break
+                if y not in seen:
+                    seen.add(y)
+                    stack.append(y)
+
+        # restore
+        adj[u].add(v)
+
+        if found:
+            to_remove.add((u, v))
+
+    kept = [e for e in edges if (e[0], e[1]) not in to_remove]
+    removed = [e for e in edges if (e[0], e[1]) in to_remove]
+    return kept, removed
+
+# =========================
+# 3) Main rule reasoning
+# =========================
+def main():
+    llm_df = pd.read_excel(LLM_REL_XLSX)
+    rel_types_df = pd.read_excel(REL_TYPES_XLSX)
+
+    rel_types, allowed_map = load_relation_types(rel_types_df)
+    allowed_set = set(rel_types)
+
+    # --- required columns in LLM table ---
+    problem_col = pick_col(llm_df, ["problem", "problem_id", "qid", "question"])
+    a_col = pick_col(llm_df, ["module_a"])
+    b_col = pick_col(llm_df, ["module_b"])
+    rt_col = pick_col(llm_df, ["relation_type"])
+    dir_col = pick_col(llm_df, ["direction"], required=False)
+    conf_col = pick_col(llm_df, ["confidence"], required=False)
+
+    # optional columns (keep if exist)
+    topic_a_col = pick_col(llm_df, ["module_a_topic"], required=False)
+    topic_b_col = pick_col(llm_df, ["module_b_topic"], required=False)
+    rationale_col = pick_col(llm_df, ["decision_rationale"], required=False)
+    disc_col = pick_col(llm_df, ["problem_disciplines"], required=False)
+
+    dropped_logs = []
+    optimized_rows = []
+    structure_rows = []
+
+    # normalize text fields
+    for c in [problem_col, a_col, b_col, rt_col, dir_col, conf_col, topic_a_col, topic_b_col, rationale_col, disc_col]:
+        if c and c in llm_df.columns:
+            llm_df[c] = llm_df[c].apply(norm_text)
+
+    # --- process per problem ---
+    for p, sub in llm_df.groupby(problem_col):
+        p = norm_text(p)
+
+        # Step 1) normalize type + direction; standardize dependency edge direction
+        temp = []
+        for _, r in sub.iterrows():
+            orig_a = r[a_col]
+            orig_b = r[b_col]
+            orig_rt = r[rt_col]
+            orig_dir = r[dir_col] if dir_col else ""
+            orig_conf = r[conf_col] if conf_col else ""
+            score = conf_to_score(orig_conf)
+
+            rt = normalize_relation_type(orig_rt, allowed_map)
+            dir_norm = normalize_arrow(orig_dir)
+
+            # 若类型不在允许集合，降级为 Uncertain（保留到日志）
+            if rt not in allowed_set:
+                dropped_logs.append({
+                    "problem": p,
+                    "orig_module_a": orig_a,
+                    "orig_module_b": orig_b,
+                    "orig_relation_type": orig_rt,
+                    "orig_direction": orig_dir,
+                    "confidence": orig_conf,
+                    "action": "downgrade_to_uncertain",
+                    "reason": f"relation_type not in allowed set: {sorted(list(allowed_set))}"
+                })
+                rt = "Uncertain"
+                dir_norm = "NA"
+                score = 0
+
+            # self-loop 直接丢弃
+            if orig_a and orig_b and orig_a == orig_b:
+                dropped_logs.append({
+                    "problem": p, "orig_module_a": orig_a, "orig_module_b": orig_b,
+                    "orig_relation_type": orig_rt, "orig_direction": orig_dir, "confidence": orig_conf,
+                    "action": "drop", "reason": "self-loop"
+                })
+                continue
+
+            is_dep = rt in ("Causal", "Progressive")
+
+            # 依赖边：用 direction 把 module_a/module_b 标准化为“源->目标”，并统一 direction= A->B
+            if is_dep:
+                if dir_norm == "B->A":
+                    src, dst = orig_b, orig_a
+                else:
+                    # A->B 或 NA（若 NA，就按原顺序）
+                    src, dst = orig_a, orig_b
+                module_a, module_b, out_dir = src, dst, "A->B"
+            else:
+                # Parallel 或 Uncertain：无向/不确定，按字母排序保持一致
+                u, v = sorted([orig_a, orig_b])
+                module_a, module_b, out_dir = u, v, "NA"
+
+            temp.append({
+                "problem": p,
+                "module_a": module_a,
+                "module_b": module_b,
+                "relation_type": rt,
+                "direction": out_dir,
+                "confidence": orig_conf,
+                "confidence_score": score,
+                "orig_module_a": orig_a,
+                "orig_module_b": orig_b,
+                "orig_relation_type": orig_rt,
+                "orig_direction": orig_dir,
+                "module_a_topic": r[topic_a_col] if topic_a_col else "",
+                "module_b_topic": r[topic_b_col] if topic_b_col else "",
+                "decision_rationale": r[rationale_col] if rationale_col else "",
+                "problem_disciplines": r[disc_col] if disc_col else "",
+                "rule_notes": ""
+            })
+
+        temp_df = pd.DataFrame(temp)
+        if temp_df.empty:
+            continue
+
+        # Step 2) merge duplicates: same (module_a,module_b,relation_type, direction) keep highest confidence
+        key_cols = ["module_a", "module_b", "relation_type", "direction"]
+        temp_df = temp_df.sort_values("confidence_score", ascending=False)
+        dedup = temp_df.drop_duplicates(subset=key_cols, keep="first").copy()
+
+        # log removed duplicates
+        dup_mask = temp_df.duplicated(subset=key_cols, keep="first")
+        for _, rr in temp_df[dup_mask].iterrows():
+            dropped_logs.append({
+                "problem": p,
+                "orig_module_a": rr["orig_module_a"],
+                "orig_module_b": rr["orig_module_b"],
+                "orig_relation_type": rr["orig_relation_type"],
+                "orig_direction": rr["orig_direction"],
+                "confidence": rr["confidence"],
+                "action": "drop_duplicate",
+                "reason": "duplicate edge (same modules/type/direction), keep highest confidence"
+            })
+
+        # Step 3) conflict handling for same unordered module pair with different types:
+        # priority: Dependency(Causal/Progressive) > Parallel > Uncertain, then confidence_score
+        def type_priority(t: str) -> int:
+            if t == "Causal":
+                return 30
+            if t == "Progressive":
+                return 20
+            if t == "Parallel":
+                return 10
+            if t == "Uncertain":
+                return 0
+            return 0
+
+        dedup["pair_key"] = dedup.apply(lambda r: "||".join(sorted([r["module_a"], r["module_b"]])), axis=1)
+        final_rows = []
+        for pk, g in dedup.groupby("pair_key"):
+            g = g.copy()
+            g["priority"] = g["relation_type"].apply(type_priority)
+            g = g.sort_values(["priority", "confidence_score"], ascending=False)
+            keep = g.iloc[0].copy()
+
+            # drop the rest as conflicts
+            for _, rr in g.iloc[1:].iterrows():
+                dropped_logs.append({
+                    "problem": p,
+                    "orig_module_a": rr["orig_module_a"],
+                    "orig_module_b": rr["orig_module_b"],
+                    "orig_relation_type": rr["orig_relation_type"],
+                    "orig_direction": rr["orig_direction"],
+                    "confidence": rr["confidence"],
+                    "action": "drop_conflict",
+                    "reason": f"conflict on same module pair, keep {keep['relation_type']} (priority/confidence)"
+                })
+            final_rows.append(keep)
+
+        final_df = pd.DataFrame(final_rows)
+        if final_df.empty:
+            continue
+
+        # Step 4) handle cycles on dependency edges (Causal/Progressive) by dropping lowest confidence edge in a cycle
+        dep_df = final_df[final_df["relation_type"].isin(["Causal", "Progressive"])].copy()
+        changed = True
+        while changed and not dep_df.empty:
+            changed = False
+            dep_edges = [(r["module_a"], r["module_b"]) for _, r in dep_df.iterrows()]
+            nodes = sorted(set([u for u, v in dep_edges] + [v for u, v in dep_edges]))
+            adj = build_adj(dep_edges)
+            cyc = find_cycle(nodes, adj)
+            if cyc:
+                # cycle nodes list e.g., [A,B,C,A]
+                # pick an edge in the cycle with lowest confidence_score and drop it
+                cyc_edges = set()
+                for i in range(len(cyc) - 1):
+                    cyc_edges.add((cyc[i], cyc[i+1]))
+
+                cand = dep_df[dep_df.apply(lambda r: (r["module_a"], r["module_b"]) in cyc_edges, axis=1)].copy()
+                if cand.empty:
+                    break
+                cand = cand.sort_values("confidence_score", ascending=True)
+                drop_row = cand.iloc[0]
+                drop_u, drop_v = drop_row["module_a"], drop_row["module_b"]
+                dropped_logs.append({
+                    "problem": p,
+                    "orig_module_a": drop_row["orig_module_a"],
+                    "orig_module_b": drop_row["orig_module_b"],
+                    "orig_relation_type": drop_row["orig_relation_type"],
+                    "orig_direction": drop_row["orig_direction"],
+                    "confidence": drop_row["confidence"],
+                    "action": "drop_cycle_edge",
+                    "reason": f"break dependency cycle by dropping lowest-confidence edge {drop_u}->{drop_v}"
+                })
+                dep_df = dep_df[~((dep_df["module_a"] == drop_u) & (dep_df["module_b"] == drop_v))].copy()
+                changed = True
+
+        # merge back non-dependency edges
+        non_dep_df = final_df[~final_df["relation_type"].isin(["Causal", "Progressive"])].copy()
+        merged_df = pd.concat([dep_df, non_dep_df], ignore_index=True)
+
+        # Step 5) transitive reduction on dependency edges
+        dep_df2 = merged_df[merged_df["relation_type"].isin(["Causal", "Progressive"])].copy()
+        if not dep_df2.empty:
+            directed_edges = [(r["module_a"], r["module_b"], int(r["confidence_score"])) for _, r in dep_df2.iterrows()]
+            kept, removed = transitive_reduction(directed_edges)
+            removed_set = set([(u, v) for u, v, _ in removed])
+
+            # log removed transitive edges
+            for _, rr in dep_df2.iterrows():
+                if (rr["module_a"], rr["module_b"]) in removed_set:
+                    dropped_logs.append({
+                        "problem": p,
+                        "orig_module_a": rr["orig_module_a"],
+                        "orig_module_b": rr["orig_module_b"],
+                        "orig_relation_type": rr["orig_relation_type"],
+                        "orig_direction": rr["orig_direction"],
+                        "confidence": rr["confidence"],
+                        "action": "drop_transitive_redundancy",
+                        "reason": f"transitive redundancy (implied by other dependency paths): {rr['module_a']}->{rr['module_b']}"
+                    })
+
+            dep_df2 = dep_df2[~dep_df2.apply(lambda r: (r["module_a"], r["module_b"]) in removed_set, axis=1)].copy()
+
+        merged_df = pd.concat([dep_df2, non_dep_df], ignore_index=True)
+
+        # Step 6) branch / converge identification on dependency graph
+        dep_edges_final = [(r["module_a"], r["module_b"]) for _, r in merged_df[merged_df["relation_type"].isin(["Causal", "Progressive"])].iterrows()]
+        out_deg = defaultdict(int)
+        in_deg = defaultdict(int)
+        for u, v in dep_edges_final:
+            out_deg[u] += 1
+            in_deg[v] += 1
+
+        merged_df["is_branch_source"] = merged_df.apply(
+            lambda r: True if (r["relation_type"] in ("Causal", "Progressive") and out_deg[r["module_a"]] > 1) else False, axis=1
+        )
+        merged_df["is_converge_target"] = merged_df.apply(
+            lambda r: True if (r["relation_type"] in ("Causal", "Progressive") and in_deg[r["module_b"]] > 1) else False, axis=1
+        )
+
+        # Step 7) per-problem structure summary
+        nodes = sorted(set([u for u, v in dep_edges_final] + [v for u, v in dep_edges_final]))
+        structure_rows.append({
+            "problem": p,
+            "num_modules_in_dependency_graph": len(nodes),
+            "num_dependency_edges": len(dep_edges_final),
+            "num_parallel_edges": int((merged_df["relation_type"] == "Parallel").sum()),
+            "num_uncertain_edges": int((merged_df["relation_type"] == "Uncertain").sum()),
+            "num_branch_sources": sum(1 for n in nodes if out_deg[n] > 1),
+            "num_converge_targets": sum(1 for n in nodes if in_deg[n] > 1),
+        })
+
+        # collect optimized edges
+        merged_df = merged_df.drop(columns=["pair_key"], errors="ignore")
+        optimized_rows.append(merged_df)
+
+    # =========================
+    # 4) Save
+    # =========================
+    opt_df = pd.concat(optimized_rows, ignore_index=True) if optimized_rows else pd.DataFrame()
+    log_df = pd.DataFrame(dropped_logs)
+    sum_df = pd.DataFrame(structure_rows)
+
+    with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as w:
+        opt_df.to_excel(w, index=False, sheet_name="optimized_edges")
+        log_df.to_excel(w, index=False, sheet_name="dropped_edges_log")
+        sum_df.to_excel(w, index=False, sheet_name="structure_summary")
+
+    print(f"[OK] 输出完成：{OUT_XLSX}")
+    print("[INFO] Sheets:", ["optimized_edges", "dropped_edges_log", "structure_summary"])
+
+if __name__ == "__main__":
+    main()
